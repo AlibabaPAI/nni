@@ -168,8 +168,8 @@ class QAT_Quantizer(Quantizer):
         """
         delete redundant parameters in quantize module
         """
-        del_attr_list = ['old_weight', 'ema_decay', 'tracked_min_activation', 'tracked_max_activation', 'tracked_min_input', \
-        'tracked_max_input', 'scale', 'zero_point', 'weight_bit', 'activation_bit']
+        del_attr_list = ['old_weight', 'old_bias', 'ema_decay', 'tracked_min_activation', 'tracked_max_activation',
+                         'tracked_min_input', 'tracked_max_input', 'scale', 'zero_point', 'weight_bit', 'activation_bit']
         for attr in del_attr_list:
             if hasattr(module, attr):
                 delattr(module, attr)
@@ -184,10 +184,11 @@ class QAT_Quantizer(Quantizer):
             List of configurations
         """
         schema = CompressorSchema([{
-            Optional('quant_types'): Schema([lambda x: x in ['weight', 'output']]),
-            Optional('quant_bits'): Or(And(int, lambda n: 0 < n < 32), Schema({
+            Optional('quant_types'): Schema([lambda x: x in ['weight', 'output', 'bias']]),
+            Optional('quant_bits'): Or(And(int, lambda n: 0 < n <= 32), Schema({
                 Optional('weight'): And(int, lambda n: 0 < n < 32),
                 Optional('output'): And(int, lambda n: 0 < n < 32),
+                Optional('bias'): And(int, lambda n: 0 < n <= 32),
             })),
             Optional('quant_start_step'): And(int, lambda n: n >= 0),
             Optional('op_types'): [str],
@@ -242,6 +243,24 @@ class QAT_Quantizer(Quantizer):
         real_val = op.scale * (quantized_val - op.zero_point)
         return real_val
 
+    def quantize_bias(self, wrapper, **kwargs):
+        config = wrapper.config
+        module = wrapper.module
+        # if bias exists, quantize bias to uint32
+        if hasattr(wrapper.module, 'bias') and wrapper.module.bias is not None:
+            bias = wrapper.module.bias.data
+            # bias is quantized to 32 bit in the origin paper
+            # here, for easier customization, we set it through config
+            bias_bits = get_bits_length(config, 'bias')
+            rmin, rmax = torch.min(bias), torch.max(bias)
+            module.scale, module.zero_point = update_quantization_param(bias_bits, rmin, rmax)
+            bias = self._quantize(bias_bits, module, bias)
+            bias = self._dequantize(module, bias)
+            wrapper.module.bias.data = bias
+            return bias
+        else:
+            return None
+
     def quantize_weight(self, wrapper, **kwargs):
         config = wrapper.config
         module = wrapper.module
@@ -264,17 +283,6 @@ class QAT_Quantizer(Quantizer):
                                                                     module.ema_decay)
         module.tracked_max_input = update_ema(module.tracked_max_input, current_max,
                                                                     module.ema_decay)
-
-        # if bias exists, quantize bias to uint32
-        if hasattr(wrapper.module, 'bias') and wrapper.module.bias is not None:
-            bias = wrapper.module.bias.data
-            bias_bits = 32
-            rmin, rmax = torch.min(bias), torch.max(bias)
-            module.scale, module.zero_point = update_quantization_param(bias_bits, rmin, rmax)
-            bias = self._quantize(bias_bits, module, bias)
-            bias = self._dequantize(module, bias)
-            wrapper.module.bias.data = bias
-
 
         # quantize weight
         rmin, rmax = torch.min(weight), torch.max(weight)

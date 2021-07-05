@@ -52,9 +52,10 @@ def main():
     DoReFaQuantizer(configure_list).compress(model)
     '''
     configure_list = [{
-        'quant_types': ['weight'],
+        'quant_types': ['weight', 'bias'],
         'quant_bits': {
             'weight': 8,
+            'bias': 32
         }, # you can just use `int` here because all `quan_types` share same bits length, see config for `ReLu6` below.
         'op_types':['Conv2d', 'Linear']
     }, {

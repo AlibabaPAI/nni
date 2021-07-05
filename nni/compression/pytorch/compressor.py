@@ -500,6 +500,13 @@ class QuantizerModuleWrapper(torch.nn.Module):
                 self.module.register_parameter('old_weight', torch.nn.Parameter(self.module.weight))
                 delattr(self.module, 'weight')
                 self.module.register_buffer('weight', self.module.old_weight)
+        if 'bias' in config['quant_types']:
+            if not _check_bias(self.module):
+                _logger.warning('Module %s does not have parameter "bias"', self.name)
+            else:
+                self.module.register_parameter('old_bias', torch.nn.Parameter(self.module.bias))
+                delattr(self.module, 'bias')
+                self.module.register_buffer('bias', self.module.old_bias)
 
     def forward(self, *inputs):
         if 'input' in self.config['quant_types']:
@@ -513,9 +520,13 @@ class QuantizerModuleWrapper(torch.nn.Module):
                 self.module.old_weight,
                 QuantType.QUANT_WEIGHT,
                 self, inputs[0])
-            result = self.module(*inputs)
-        else:
-            result = self.module(*inputs)
+        if 'bias' in self.config['quant_types'] and _check_bias(self.module):
+            self.quantizer.quant_grad(
+                self.module.old_bias,
+                QuantType.QUANT_BIAS,
+                self, inputs[0])
+
+        result = self.module(*inputs)
 
         if 'output' in self.config['quant_types']:
             result = self.quantizer.quant_grad(
@@ -551,6 +562,17 @@ class Quantizer(Compressor):
             the wrapper for origin module
         """
         raise NotImplementedError('Quantizer must overload quantize_weight()')
+
+    def quantize_bias(self, wrapper, **kwargs):
+        """
+        quantize should overload this method to quantize bias.
+        This method is effectively hooked to :meth:`forward` of the model.
+        Parameters
+        ----------
+        wrapper : QuantizerModuleWrapper
+            the wrapper for origin module
+        """
+        raise NotImplementedError('Quantizer must overload quantize_bias()')
 
     def quantize_output(self, output, wrapper, **kwargs):
         """
@@ -669,12 +691,15 @@ class QuantType:
     """
     QUANT_INPUT = 0
     QUANT_WEIGHT = 1
-    QUANT_OUTPUT = 2
+    QUANT_BIAS = 2
+    QUANT_OUTPUT = 3
+
 
 QType_Dict = {
     0: "input",
     1: "weight",
-    2: "output"
+    2: "bias",
+    3: "output"
 }
 
 class QuantGrad(torch.autograd.Function):
@@ -773,11 +798,19 @@ def _check_weight(module):
     except AttributeError:
         return False
 
+def _check_bias(module):
+    try:
+        return isinstance(module.bias.data, torch.Tensor)
+    except AttributeError:
+        return False
+
 def quantize_helper(tensor, quant_type, wrapper, input_tensor=None, **kwargs):
     if quant_type == QuantType.QUANT_INPUT:
         output = wrapper.quantizer.quantize_input(*tensor, wrapper=wrapper, **kwargs)
     elif quant_type == QuantType.QUANT_WEIGHT:
         output = wrapper.quantizer.quantize_weight(wrapper, input_tensor=input_tensor, **kwargs)
+    elif quant_type == QuantType.QUANT_BIAS:
+        output = wrapper.quantizer.quantize_bias(wrapper, input_tensor=input_tensor, **kwargs)
     elif quant_type == QuantType.QUANT_OUTPUT:
         output = wrapper.quantizer.quantize_output(tensor, wrapper, **kwargs)
     else:
