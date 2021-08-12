@@ -2,12 +2,14 @@ import torch
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from nni.algorithms.compression.pytorch.quantization import QAT_Quantizer
+from nni.compression.pytorch.quantization.settings import change_default_quant_settings
 
 import sys
 sys.path.append('../models')
 from mnist.naive import NaiveModel
 
-def train(model, quantizer, device, train_loader, optimizer):
+
+def train(model, device, train_loader, optimizer):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -52,17 +54,36 @@ def main():
     DoReFaQuantizer(configure_list).compress(model)
     '''
     configure_list = [{
-        'quant_types': ['weight'],
-        'quant_bits': {
-            'weight': 8,
-        }, # you can just use `int` here because all `quan_types` share same bits length, see config for `ReLu6` below.
-        'op_types':['Conv2d', 'Linear']
-    }, {
-        'quant_types': ['output'],
-        'quant_bits': 8,
-        'quant_start_step': 1000,
-        'op_types':['ReLU6']
-    }]
+            'quant_types': ['weight', 'input'],
+            'quant_bits': {'weight': 8, 'input': 8},
+            'op_names': ['conv1']
+        }, {
+            'quant_types': ['output'],
+            'quant_bits': {'output': 8, },
+            'op_names': ['relu1']
+        }, {
+            'quant_types': ['weight', 'input'],
+            'quant_bits': {'weight': 8, 'input': 8},
+            'op_names': ['conv2']
+        }, {
+            'quant_types': ['output'],
+            'quant_bits': {'output': 8},
+            'op_names': ['relu2']
+        }, {
+            'quant_types': ['output', 'weight', 'input'],
+            'quant_bits': {'output': 8, 'weight': 8, 'input': 8},
+            'op_names': ['fc1'],
+        }, {
+            'quant_types': ['output', 'weight', ],
+            'quant_bits': {'output': 8, 'weight': 8, 'input': 8},
+            'op_names': ['fc2'],
+        }]
+    change_default_quant_settings('weight', 'per_channel_symmetric', 'int')
+    change_default_quant_settings('output', 'per_tensor_symmetric', 'int')
+    change_default_quant_settings('input', 'per_tensor_symmetric', 'int')
+
+    model = NaiveModel().to(device)
+    dummy_input = torch.randn(1, 1, 28, 28).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
     quantizer = QAT_Quantizer(model, configure_list, optimizer)
     quantizer.compress()

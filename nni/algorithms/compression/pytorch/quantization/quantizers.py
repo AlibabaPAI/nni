@@ -7,9 +7,17 @@ from collections import defaultdict
 import torch
 from schema import Schema, And, Or, Optional
 from nni.compression.pytorch.utils.config_validation import QuantizerSchema
-from nni.compression.pytorch.compressor import BN_FOLD_TAG, Quantizer, QuantForward, QuantGrad, QuantType
-
-from .observers import default_weight_observer, default_histogram_observer
+from nni.compression.pytorch.compressor import Quantizer, QuantForward, QuantGrad
+from nni.compression.pytorch.quantization.literal import (
+    BN_FOLD_TAG,
+    QuantConfigLiteral,
+    QuantScheme,
+    QuantDtype,
+    QuantType
+)
+from nni.compression.pytorch.quantization.settings import QuantSettings
+from nni.compression.pytorch.quantization.utils import calculate_qmin_qmax, get_bits_length, get_min_max_value
+from nni.compression.pytorch.quantization.observers import default_weight_observer, default_histogram_observer
 
 __all__ = ['NaiveQuantizer', 'QAT_Quantizer', 'DoReFaQuantizer', 'BNNQuantizer', 'LsqQuantizer', 'ObserverQuantizer']
 
@@ -66,7 +74,7 @@ def update_ema(biased_ema, value, decay):
     return biased_ema
 
 
-def update_quantization_param(bits, rmin, rmax):
+def update_quantization_param(bits, rmin, rmax, dtype, scheme):
     """
     calculate the `zero_point` and `scale`.
 
@@ -78,41 +86,46 @@ def update_quantization_param(bits, rmin, rmax):
         min value of real value
     rmax : Tensor
         max value of real value
-
+    dtype : QuantDtype
+        quantized data type
+    scheme : QuantScheme
+        quantization scheme to be used
     Returns
     -------
     float, float
     """
+
     # extend the [min, max] interval to ensure that it contains 0.
     # Otherwise, we would not meet the requirement that 0 be an exactly
     # representable value.
-    rmin = torch.min(rmin, torch.Tensor([0]).to(rmin.device))
-    rmax = torch.max(rmax, torch.Tensor([0]).to(rmin.device))
-    qmin = torch.Tensor([0]).to(rmin.device)
-    qmax = torch.Tensor([(1 << bits) - 1]).to(rmin.device)
+    # I think this is for activations that need to be pad in the training.
+    # However this is a default behavior in PyTorch quantization observer.
+    # So we also make it a default behavior
+    rmin = torch.min(rmin, torch.zeros_like(rmin))
+    rmax = torch.max(rmax, torch.zeros_like(rmax))
+    zero_point = torch.zeros_like(rmin)
 
-    # First determine the scale.
-    scale = (rmax - rmin) / (qmax - qmin)
+    # todo: there is no need to calculate qmin and qmax again
+    qmin, qmax = calculate_qmin_qmax(bits, dtype)
 
-    # Zero-point computation.
-    initial_zero_point = qmin - rmin / scale
-
-    # Now we need to nudge the zero point to be an integer
-    if initial_zero_point < qmin:
-        nudged_zero_point = qmin
-    elif initial_zero_point > qmax:
-        nudged_zero_point = qmax
+    if scheme in [QuantScheme.per_tensor_symmetric, QuantScheme.per_channel_symmetric]:
+        abs_max = torch.max(torch.abs(rmin), torch.abs(rmax))
+        scale = abs_max / (float(qmax - qmin) / 2)
+        if dtype == QuantDtype.uint:
+            zero_point_val = (qmin + qmax) // 2
+            zero_point = zero_point.new_full(zero_point.size(), zero_point_val)
     else:
-        nudged_zero_point = torch.round(initial_zero_point)
+        scale = (rmax - rmin) / (qmax - qmin)
+        zero_point = qmin - torch.round(rmin / scale)
 
-    return scale, nudged_zero_point
+    zero_point = torch.clamp(zero_point, qmin, qmax)
 
+    # todo: add these lines
+    # eps = torch.finfo(torch.float32).eps
+    # scale = torch.max(scale, eps)
 
-def get_bits_length(config, quant_type):
-    if isinstance(config["quant_bits"], int):
-        return config["quant_bits"]
-    else:
-        return config["quant_bits"].get(quant_type)
+    return scale, zero_point
+
 
 class QATGrad(QuantGrad):
     @staticmethod
@@ -385,29 +398,51 @@ class QAT_Quantizer(Quantizer):
         device = next(model.parameters()).device
         self.bound_model.register_buffer("steps", torch.Tensor([1]))
         for layer, config in modules_to_compress:
-            layer.module.register_buffer("zero_point", torch.Tensor([0.0]))
-            layer.module.register_buffer("scale", torch.Tensor([1.0]))
-            layer.module.register_buffer('ema_decay', torch.Tensor([0.99]))
+            module = layer.module
+            name = layer.name
+            assert name in self.all_shapes, "Could not found shapes for layer {}".format(name)
+            inp_shape, oup_shape = self.all_shapes[name]
+            quant_setting = QuantSettings()
+            setattr(module, 'ema_decay', 0.99)
             if "weight" in config.get("quant_types", []):
-                layer.module.register_buffer('weight_bit', torch.zeros(1))
-                layer.module.register_buffer('tracked_min_input', torch.zeros(1))
-                layer.module.register_buffer('tracked_max_input', torch.zeros(1))
+                module.register_buffer('weight_bits', torch.zeros(1))
+                quant_setting.update_from_config(config, 'weight')
+                weight_shape = quant_setting.get_quant_shape(module.weight.shape, QuantType.weight)
+                module.register_buffer(QuantConfigLiteral.weight_scale, torch.zeros(weight_shape))
+                module.register_buffer(QuantConfigLiteral.weight_zero_point, torch.zeros(weight_shape))
+
+            if "input" in config.get("quant_types", []):
+                quant_setting.update_from_config(config, 'input')
+                module.register_buffer('input_bits', torch.zeros(1))
+                input_shape = quant_setting.get_quant_shape(inp_shape, QuantType.input)
+                module.register_buffer(QuantConfigLiteral.input_scale, torch.zeros(input_shape))
+                module.register_buffer(QuantConfigLiteral.input_zero_point, torch.zeros(input_shape))
+                module.register_buffer('tracked_min_input', torch.zeros(input_shape))
+                module.register_buffer('tracked_max_input', torch.zeros(input_shape))
+
             if "output" in config.get("quant_types", []):
-                layer.module.register_buffer('activation_bit', torch.zeros(1))
-                layer.module.register_buffer('tracked_min_activation', torch.zeros(1))
-                layer.module.register_buffer('tracked_max_activation', torch.zeros(1))
+                quant_setting.update_from_config(config, 'output')
+                output_shape = quant_setting.get_quant_shape(oup_shape, QuantType.output)
+                module.register_buffer('output_bits', torch.zeros(1))
+                module.register_buffer('tracked_min_output', torch.zeros(output_shape))
+                module.register_buffer('tracked_max_output', torch.zeros(output_shape))
+                module.register_buffer(QuantConfigLiteral.output_scale, torch.zeros(output_shape))
+                module.register_buffer(QuantConfigLiteral.output_zero_point, torch.zeros(output_shape))
+
+            setattr(module, QuantConfigLiteral.quant_settings, quant_setting)
         self.bound_model.to(device)
 
     def _del_simulated_attr(self, module):
         """
         delete redundant parameters in quantize module
         """
-        del_attr_list = ['old_weight', 'old_bias', 'ema_decay', 'tracked_min_activation', 'tracked_max_activation',
-                         'tracked_min_input', 'tracked_max_input', 'scale', 'zero_point', 'weight_bit',
-                         'activation_bit', 'BN_FOLD_TAG']
+        del_attr_list = ['old_weight', 'old_bias', 'ema_decay', 'tracked_min_output', 'tracked_max_output',
+                         'tracked_min_input', 'tracked_max_input', 'weight_bits', 'output_bits', 'BN_FOLD_TAG',
+                         'input_bits']
         for attr in del_attr_list:
             if hasattr(module, attr):
                 delattr(module, attr)
+        super()._del_simulated_attr(module)
 
     def validate_config(self, model, config_list):
         """
@@ -424,6 +459,16 @@ class QAT_Quantizer(Quantizer):
                 Optional('weight'): And(int, lambda n: 0 < n < 32),
                 Optional('output'): And(int, lambda n: 0 < n < 32),
             })),
+            Optional(QuantConfigLiteral.quant_scheme): Or(lambda x: x in QuantScheme.valid_values(), Schema({
+                Optional('input'): lambda x: x in QuantScheme.valid_values(),
+                Optional('weight'): lambda x: x in QuantScheme.valid_values(),
+                Optional('output'): lambda x: x in QuantScheme.valid_values()
+            })),
+            Optional(QuantConfigLiteral.quant_dtype): Or(lambda x: x in QuantDtype.valid_values(), Schema({
+                Optional('input'): lambda x: x in QuantDtype.valid_values(),
+                Optional('weight'): lambda x: x in QuantDtype.valid_values(),
+                Optional('output'): lambda x: x in QuantDtype.valid_values()
+            })),
             Optional('quant_start_step'): And(int, lambda n: n >= 0),
             Optional('op_types'): [str],
             Optional('op_names'): [str],
@@ -432,33 +477,33 @@ class QAT_Quantizer(Quantizer):
 
         schema.validate(config_list)
 
-    def _quantize(self, bits, op, real_val):
+    def _quantize(self, x, scale, zero_point, qmin, qmax):
         """
         quantize real value.
 
         Parameters
         ----------
-        bits : int
-            quantization bits length
-        op : torch.nn.Module
-            target module
-        real_val : Tensor
-            real value to be quantized
+        x : torch.Tensor
+            the real value to be quantized
+        scale : torch.Tensor
+            quantization scale
+        zero_point : torch.Tensor
+            quantization zero point
+        qmin : int
+            lower bound of the int range
+        qmax : int
+            upper bound of the int range
 
         Returns
         -------
         Tensor
         """
-        op.zero_point = op.zero_point.to(real_val.device)
-        op.scale = op.scale.to(real_val.device)
-        transformed_val = op.zero_point + real_val / op.scale
-        qmin = 0
-        qmax = (1 << bits) - 1
+        transformed_val = zero_point + x / scale
         clamped_val = torch.clamp(transformed_val, qmin, qmax)
         quantized_val = torch.round(clamped_val)
         return quantized_val
 
-    def _dequantize(self, op, quantized_val):
+    def _dequantize(self, x, scale, zero_point):
         """
         dequantize quantized value.
         Because we simulate quantization in training process, all the computations still happen as float point computations, which means we
@@ -466,49 +511,104 @@ class QAT_Quantizer(Quantizer):
 
         Parameters
         ----------
-        op : torch.nn.Module
-            target module
-        quantized_val : float
-            quantized_val value to be dequantized
+        x : torch.Tensor
+            the quantized value to be de-quantized
+        scale : torch.Tensor
+            quantization scale
+        zero_point : torch.Tensor
+            quantization zero point
 
         Returns
         -------
-        float
+        Tensor
         """
-        real_val = op.scale * (quantized_val - op.zero_point)
+        real_val = scale * (x - zero_point)
         return real_val
 
-    def quantize_weight(self, wrapper, **kwargs):
+    def quantize_weight(self, weight, wrapper, **kwargs):
         config = wrapper.config
         module = wrapper.module
-        input = kwargs['input_tensor']  # pylint: disable=redefined-builtin
-        weight = copy.deepcopy(wrapper.module.old_weight.data)
         weight_bits = get_bits_length(config, 'weight')
         quant_start_step = config.get('quant_start_step', 0)
         assert weight_bits >= 1, "quant bits length should be at least 1"
 
-        # we dont update weight in evaluation stage
-        if quant_start_step > self.bound_model.steps:
-            module.tracked_min_input, module.tracked_max_input = torch.min(input), torch.max(input)
-            return weight
+        quant_settings = getattr(module, QuantConfigLiteral.quant_settings)
+        qmin, qmax = quant_settings.get_qmin_qmax(QuantType.weight)
+        dtype = quant_settings.get(QuantType.weight, QuantConfigLiteral.quant_dtype)
+        scheme = quant_settings.get(QuantType.weight, QuantConfigLiteral.quant_scheme)
 
+        # In evaluation mode, we only quantize weight without updating statistics
         if not wrapper.training:
+            # todo: weight only needs to be quantized once
+            scale = getattr(module, QuantConfigLiteral.weight_scale)
+            zero_point = getattr(module, QuantConfigLiteral.weight_zero_point)
+            weight = self._quantize(weight, scale, zero_point, qmin, qmax)
+            weight = self._dequantize(weight, scale, zero_point)
+            wrapper.module.weight = weight
             return weight
 
-        current_min, current_max = torch.min(input), torch.max(input)
-        module.tracked_min_input = update_ema(module.tracked_min_input, current_min,
-                                                                    module.ema_decay)
-        module.tracked_max_input = update_ema(module.tracked_max_input, current_max,
-                                                                    module.ema_decay)
+        if quant_start_step > self.bound_model.steps:
+            return weight
 
-        # quantize weight
-        rmin, rmax = torch.min(weight), torch.max(weight)
-        module.scale, module.zero_point = update_quantization_param(weight_bits, rmin, rmax)
-        weight = self._quantize(weight_bits, module, weight)
-        weight = self._dequantize(module, weight)
-        module.weight_bit = torch.Tensor([weight_bits])
+        target_dim = quant_settings.get_target_dim(QuantType.weight)
+        rmin, rmax = get_min_max_value(weight, target_dim)
+        scale, zero_point = update_quantization_param(weight_bits, rmin, rmax, dtype, scheme)
+        getattr(module, QuantConfigLiteral.weight_scale).copy_(scale)
+        getattr(module, QuantConfigLiteral.weight_zero_point).copy_(zero_point)
+        weight = self._quantize(weight, scale, zero_point, qmin, qmax)
+        weight = self._dequantize(weight, scale, zero_point)
+        module.weight_bits = torch.Tensor([weight_bits])
+        # Weight can not be in-place modified, so when use torch.nn.DataParallel, this update
+        # will be lost after each forward process. However, this update takes effect on each
+        # replicated module during each forward process, which will make the quantized weight
+        # be used correctly.
         wrapper.module.weight = weight
         return weight
+
+    def quantize_input(self, inputs, wrapper, **kwargs):
+        config = wrapper.config
+        module = wrapper.module
+        input_bits = get_bits_length(config, 'input')
+        module.input_bits = torch.Tensor([input_bits])
+        quant_start_step = config.get('quant_start_step', 0)
+        assert input_bits >= 1, "quant bits length should be at least 1"
+
+        quant_settings = getattr(module, QuantConfigLiteral.quant_settings)
+        dtype = quant_settings.get(QuantType.input, QuantConfigLiteral.quant_dtype)
+        scheme = quant_settings.get(QuantType.input, QuantConfigLiteral.quant_scheme)
+        qmin = quant_settings.get(QuantType.input, QuantConfigLiteral.qmin)
+        qmax = quant_settings.get(QuantType.input, QuantConfigLiteral.qmax)
+
+        if not wrapper.training:
+            scale = getattr(module, QuantConfigLiteral.input_scale)
+            zero_point = getattr(module, QuantConfigLiteral.input_zero_point)
+            inputs = self._quantize(inputs, scale, zero_point, qmin, qmax)
+            inputs = self._dequantize(inputs, scale, zero_point)
+            return inputs
+
+        target_dim = quant_settings.get_target_dim(QuantType.input)
+        input_min, input_max = get_min_max_value(inputs, target_dim)
+
+        if self.bound_model.steps == 1:
+            module.tracked_min_input.copy_(input_min)
+            module.tracked_max_input.copy_(input_max)
+
+        tracked_min_input = update_ema(module.tracked_min_input, input_min, module.ema_decay)
+        tracked_max_input = update_ema(module.tracked_max_input, input_max, module.ema_decay)
+        module.tracked_min_input.copy_(tracked_min_input)
+        module.tracked_max_input.copy_(tracked_max_input)
+
+        if quant_start_step > self.bound_model.steps:
+            return inputs
+
+        scale, zero_point = update_quantization_param(
+            input_bits, module.tracked_min_input, module.tracked_max_input, dtype, scheme)
+        getattr(module, QuantConfigLiteral.input_scale).copy_(scale)
+        getattr(module, QuantConfigLiteral.input_zero_point).copy_(zero_point)
+
+        inputs = self._quantize(inputs, scale, zero_point, qmin, qmax)
+        inputs = self._dequantize(inputs, scale, zero_point)
+        return inputs
 
     def quantize_output(self, output, wrapper, **kwargs):
         config = wrapper.config
@@ -518,22 +618,41 @@ class QAT_Quantizer(Quantizer):
         quant_start_step = config.get('quant_start_step', 0)
         assert output_bits >= 1, "quant bits length should be at least 1"
 
-        if quant_start_step > self.bound_model.steps:
-            module.tracked_min_activation, module.tracked_max_activation = torch.min(output), torch.max(output)
+        quant_settings = getattr(module, QuantConfigLiteral.quant_settings)
+        dtype = quant_settings.get(QuantType.output, QuantConfigLiteral.quant_dtype)
+        scheme = quant_settings.get(QuantType.output, QuantConfigLiteral.quant_scheme)
+        qmin, qmax = quant_settings.get_qmin_qmax(QuantType.output)
+
+        if not wrapper.training:
+            scale = getattr(module, QuantConfigLiteral.output_scale)
+            zero_point = getattr(module, QuantConfigLiteral.output_zero_point)
+            output = self._quantize(output, scale, zero_point, qmin, qmax)
+            output = self._dequantize(output, scale, zero_point)
             return output
 
-        # we dont update output quantization parameters in evaluation stage
-        if wrapper.training:
-            current_min, current_max = torch.min(output), torch.max(output)
-            module.tracked_min_activation = update_ema(module.tracked_min_activation, current_min,
-                                                                       module.ema_decay)
-            module.tracked_max_activation = update_ema(module.tracked_max_activation, current_max,
-                                                                       module.ema_decay)
-            module.scale, module.zero_point = update_quantization_param(
-                output_bits, module.tracked_min_activation, module.tracked_max_activation)
-        out = self._quantize(output_bits, module, output)
-        out = self._dequantize(module, out)
-        return out
+        target_dim = quant_settings.get_target_dim(QuantType.output)
+        output_min, output_max = get_min_max_value(output, target_dim)
+
+        if self.bound_model.steps == 1:
+            module.tracked_min_output.copy_(output_min)
+            module.tracked_max_output.copy_(output_max)
+
+        tracked_min_output = update_ema(module.tracked_min_output, output_min, module.ema_decay)
+        tracked_max_output = update_ema(module.tracked_max_output, output_max, module.ema_decay)
+        module.tracked_min_output.copy_(tracked_min_output)
+        module.tracked_max_output.copy_(tracked_max_output)
+
+        if quant_start_step > self.bound_model.steps:
+            return output
+
+        scale, zero_point = update_quantization_param(
+            output_bits, module.tracked_min_output, module.tracked_max_output, dtype, scheme)
+        getattr(module, QuantConfigLiteral.output_scale).copy_(scale)
+        getattr(module, QuantConfigLiteral.output_zero_point).copy_(zero_point)
+
+        output = self._quantize(output, scale, zero_point, qmin, qmax)
+        output = self._dequantize(output, scale, zero_point)
+        return output
 
     def export_model(self, model_path, calibration_path=None, onnx_path=None, input_shape=None, device=None):
         """
@@ -564,10 +683,9 @@ class QAT_Quantizer(Quantizer):
         for name, module in self.bound_model.named_modules():
             if hasattr(module, 'weight_bit') or hasattr(module, 'activation_bit'):
                 calibration_config[name] = {}
-            if hasattr(module, 'weight_bit'):
-                calibration_config[name]['weight_bit'] = int(module.weight_bit)
-                calibration_config[name]['tracked_min_input'] = float(module.tracked_min_input)
-                calibration_config[name]['tracked_max_input'] = float(module.tracked_max_input)
+
+            if hasattr(module, 'weight_bits'):
+                calibration_config[name]['weight_bits'] = int(module.weight_bits)
 
                 # Recover weight/bias for batch normalization folding
                 if hasattr(module, BN_FOLD_TAG):
@@ -738,7 +856,7 @@ class DoReFaQuantizer(Quantizer):
 class ClipGrad(QuantGrad):
     @staticmethod
     def quant_backward(tensor, grad_output, quant_type, scale, zero_point, qmin, qmax):
-        if quant_type == QuantType.QUANT_OUTPUT:
+        if quant_type == QuantType.output:
             grad_output[torch.abs(tensor) > 1] = 0
         return grad_output
 
